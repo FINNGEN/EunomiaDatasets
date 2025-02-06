@@ -1,0 +1,118 @@
+# Generate Synthea dataset
+
+Follow https://github.com/synthetichealth/synthea?tab=readme-ov-file#developer-quick-start to install synthea.
+
+Run synthea with the following command:
+
+```{bash}
+run_synthea -s 13 -p 1000 --exporter.csv.export=true
+```
+
+This will generate 1000 patients and export their data to CSV files.
+
+# ETL the Synthea dataset
+
+Install postgres and create the database `synthea` and user `syntheauser`.
+
+Follow https://github.com/OHDSI/ETL-Synthea
+
+```{r}
+
+cd <- DatabaseConnector::createConnectionDetails(
+  dbms     = "postgresql",
+  server   = "localhost/synthea",
+  user     = "syntheauser",
+  password = "mypass",
+  port     = 5432
+)
+
+connection <- DatabaseConnector::connect(cd)
+DatabaseConnector::disconnect(connection)
+
+cdmSchema      <- "cdm_synthea10"
+cdmVersion     <- "5.4"
+syntheaVersion <- "3.3.0"
+syntheaSchema  <- "naive"
+syntheaFileLoc <- "./synthea/output/csv"
+vocabFileLoc   <- "../../FinOMOP/FinOMOP_OMOP_vocabulary/OMOP_VOCABULARIES/input_omop_vocabulary"
+
+ETLSyntheaBuilder::CreateCDMTables(connectionDetails = cd, cdmSchema = cdmSchema, cdmVersion = cdmVersion)
+
+ETLSyntheaBuilder::CreateSyntheaTables(connectionDetails = cd, syntheaSchema = syntheaSchema, syntheaVersion = syntheaVersion)
+
+ETLSyntheaBuilder::LoadSyntheaTables(connectionDetails = cd, syntheaSchema = syntheaSchema, syntheaFileLoc = syntheaFileLoc)
+
+ETLSyntheaBuilder::LoadVocabFromCsv(connectionDetails = cd, cdmSchema = cdmSchema, vocabFileLoc = vocabFileLoc)
+
+ETLSyntheaBuilder::CreateMapAndRollupTables(connectionDetails = cd, cdmSchema = cdmSchema, syntheaSchema = syntheaSchema, cdmVersion = cdmVersion, syntheaVersion = syntheaVersion)
+
+## Optional Step to create extra indices
+ETLSyntheaBuilder::CreateExtraIndices(connectionDetails = cd, cdmSchema = cdmSchema, syntheaSchema = syntheaSchema, syntheaVersion = syntheaVersion)
+
+ETLSyntheaBuilder::LoadEventTables(connectionDetails = cd, cdmSchema = cdmSchema, syntheaSchema = syntheaSchema, cdmVersion = cdmVersion, syntheaVersion = syntheaVersion)
+
+```
+
+# Move from postgres to duckdb      
+
+```{r}
+library(DBI)
+library(RPostgres)
+library(duckdb)
+
+# PostgreSQL connection details
+
+cd <- DatabaseConnector::createConnectionDetails(
+  dbms     = "postgresql",
+  server   = "localhost/synthea",
+  user     = "syntheauser",
+  password = "mypass",
+  port     = 5432
+)
+
+
+pg_schema <- "cdm_synthea10"
+
+pg_con <- DatabaseConnector::connect(cd)
+
+# Get list of tables in the schema
+query <- paste0("
+  SELECT table_name
+  FROM information_schema.tables
+  WHERE table_schema = '", pg_schema, "';")
+
+tables <- dbGetQuery(pg_con, query)$table_name
+
+# Define temporary CSV folder
+csv_dir <- tempdir()
+
+# Connect to DuckDB
+duck_con <- dbConnect(duckdb::duckdb(), "output.duckdb")
+
+# Export all tables in bulk using COPY TO (fast)
+for (table in tables) {
+  cat("Exporting table:", table, "\n")
+
+  csv_file <- file.path(csv_dir, paste0(table, ".csv"))
+
+  # PostgreSQL COPY command for fast export
+  copy_query <- paste0("COPY ", pg_schema, ".", table, " TO '", csv_file, "' WITH CSV HEADER;")
+  dbExecute(pg_con, copy_query)
+}
+
+# Import CSVs into DuckDB in bulk
+for (table in tables) {
+  csv_file <- file.path(csv_dir, paste0(table, ".csv"))
+  cat("Importing table into DuckDB:", table, "\n")
+
+  # Bulk load CSV into DuckDB
+  dbExecute(duck_con, paste0("CREATE TABLE ", table, " AS SELECT * FROM read_csv_auto('", csv_file, "');"))
+}
+
+# Close connections
+dbDisconnect(pg_con)
+dbDisconnect(duck_con)
+
+cat("Migration complete! All tables moved to DuckDB in bulk mode.\n")
+
+```
